@@ -9,6 +9,8 @@
 #include <cstring>
 #include <iostream>
 #include "Si5351C.h"
+#include "fifo.h"
+#include "FPGA_common.h"
 
 #include <thread>
 #include <chrono>
@@ -37,7 +39,8 @@ using namespace lime;
 
 /**	@brief Initializes port type and object necessary to communicate to usb device.
 */
-ConnectionSTREAM::ConnectionSTREAM(void *arg, const unsigned index, const int vid, const int pid)
+ConnectionSTREAM::ConnectionSTREAM(void *arg, const unsigned index, const int vid, const int pid) :
+    mRxService(this), mTxService(this)
 {
     m_hardwareName = "";
     isConnected = false;
@@ -84,7 +87,8 @@ ConnectionSTREAM::ConnectionSTREAM(void *arg, const unsigned index, const int vi
 */
 ConnectionSTREAM::~ConnectionSTREAM()
 {
-    mStreamService.reset();
+    mTxService.destroy();
+    mRxService.destroy();
     Close();
 }
 
@@ -184,7 +188,6 @@ int ConnectionSTREAM::Open(const unsigned index, const int vid, const int pid)
         printf("Cannot Claim Interface\n");
         return ReportError("Cannot claim interface - %s", libusb_strerror(libusb_error(r)));
     }
-    printf("Claimed Interface\n");
     isConnected = true;
     return 0;
 #endif
@@ -480,16 +483,6 @@ int ConnectionSTREAM::FinishDataReading(char *buffer, long &length, int contextH
         return 0;
 }
 
-int ConnectionSTREAM::ReadDataBlocking(char *buffer, long &length, int timeout_ms)
-{
-#ifndef __unix__
-    return InEndPt->XferData((unsigned char*)buffer, length);
-#else
-    return 0;
-#endif
-}
-
-
 /**
 	@brief Aborts reading operations
 */
@@ -628,183 +621,327 @@ void ConnectionSTREAM::AbortSending()
 #endif
 }
 
-/** @brief Configures Stream board FPGA clocks to Limelight interface
-@param tx Rx/Tx selection
-@param InterfaceClk_Hz Limelight interface frequency
-@param phaseShift_deg IQ phase shift in degrees
-@return 0-success, other-failure
-*/
-int ConnectionSTREAM::ConfigureFPGA_PLL(unsigned int pllIndex, const double interfaceClk_Hz, const double phaseShift_deg)
+static void ResetUSBFIFO(LMS64CProtocol* port)
 {
-    eLMS_DEV boardType = GetDeviceInfo().deviceName == GetDeviceName(LMS_DEV_QSPARK) ? LMS_DEV_QSPARK : LMS_DEV_UNKNOWN;
-    const uint16_t busyAddr = 0x0021;
-    if(IsOpen() == false)
-        return ReportError(ENODEV, "ConnectionSTREAM: configure FPGA PLL, device not connected");
+// TODO : USB FIFO reset command for IConnection
+    if (port == nullptr) return;
+    LMS64CProtocol::GenericPacket ctrPkt;
+    ctrPkt.cmd = CMD_USB_FIFO_RST;
+    ctrPkt.outBuffer.push_back(0x01);
+    port->TransferPacket(ctrPkt);
+    ctrPkt.outBuffer[0] = 0x00;
+    port->TransferPacket(ctrPkt);
+}
 
-    uint16_t drct_clk_ctrl_0005 = 0;
-    ReadRegister(0x0005, drct_clk_ctrl_0005);
+ConnectionSTREAM::StreamService::StreamService(ConnectionSTREAM* serPort)
+{
+    active = false;
+    port = serPort;
+    FIFO = nullptr;
+}
+ConnectionSTREAM::StreamService::~StreamService()
+{
+    destroy();
+}
 
-    if(interfaceClk_Hz < 5e6)
-    {
-        //enable direct clocking
-        WriteRegister(0x0005, drct_clk_ctrl_0005 | (1 << pllIndex));
-        uint16_t drct_clk_ctrl_0006;
-        ReadRegister(0x0006, drct_clk_ctrl_0006);
-        drct_clk_ctrl_0006 = drct_clk_ctrl_0006 & ~0x3FF;
-        const int cnt_ind = 1 << 5;
-        const int clk_ind = pllIndex;
-        drct_clk_ctrl_0006 = drct_clk_ctrl_0006 | cnt_ind | clk_ind;
-        WriteRegister(0x0006, drct_clk_ctrl_0006);
-        const uint16_t phase_reg_sel_addr = 0x0004;
-        float inputClock_Hz = interfaceClk_Hz;
-        const float oversampleClock_Hz = 100e6;
-        const int registerChainSize = 128;
-        const float phaseShift_deg = 90;
-        const float oversampleClock_ns = 1e9 / oversampleClock_Hz;
-        const float phaseStep_deg = 360 * oversampleClock_ns*(1e-9) / (1 / inputClock_Hz);
-        uint16_t phase_reg_select = (phaseShift_deg / phaseStep_deg)+0.5;
-        const float actualPhaseShift_deg = 360 * inputClock_Hz / (1 / (phase_reg_select * oversampleClock_ns*1e-9));
+int ConnectionSTREAM::StreamService::setup(const StreamConfig &config)
+{
 #ifndef NDEBUG
-        printf("reg value : %i\n", phase_reg_select);
-        printf("input clock: %f\n", inputClock_Hz);
-        printf("phase : %.2f/%.2f\n", phaseShift_deg, actualPhaseShift_deg);
+    printf("%s Service setup\n", (config.isTx ? "Tx" : "Rx"));
+    printf("channels count %i : [", (int)config.channels.size());
+    for(int i=0; i<config.channels.size(); ++i)
+        printf("%i ", (int)config.channels[i]);
+    printf("]\n");
+    string outputFormat;
+    if(config.format == StreamConfig::StreamDataFormat::STREAM_12_BIT_IN_16)
+        outputFormat = "STREAM_12_BIT_IN_16";
+    else if(config.format == StreamConfig::StreamDataFormat::STREAM_COMPLEX_FLOAT32)
+        outputFormat = "STREAM_COMPLEX_FLOAT32";
+    else if(config.format == StreamConfig::StreamDataFormat::STREAM_12_BIT_COMPRESSED)
+        outputFormat = "STREAM_12_BIT_COMPRESSED";
+    else
+        outputFormat = "undefined";
+    printf("Output format: %s\n", outputFormat.c_str());
+    string linkFormat;
+    if(config.linkFormat == StreamConfig::StreamDataFormat::STREAM_12_BIT_IN_16)
+        linkFormat = "STREAM_12_BIT_IN_16";
+    else if(config.linkFormat == StreamConfig::StreamDataFormat::STREAM_COMPLEX_FLOAT32)
+        linkFormat = "STREAM_COMPLEX_FLOAT32";
+    else if(config.linkFormat == StreamConfig::StreamDataFormat::STREAM_12_BIT_COMPRESSED)
+        linkFormat = "STREAM_12_BIT_COMPRESSED";
+    else
+        linkFormat = "undefined";
+    printf("Link format: %s\n", linkFormat.c_str());
 #endif
-        if(WriteRegister(phase_reg_sel_addr, phase_reg_select) != 0)
-            return ReportError(EIO, "ConnectionSTREAM: configure FPGA PLL, failed to write registers");
-        const uint16_t LOAD_PH_REG = 1 << 10;
-        WriteRegister(0x0006, drct_clk_ctrl_0006 | LOAD_PH_REG);
-        WriteRegister(0x0006, drct_clk_ctrl_0006);
+    mActiveStreamConfig = config;
+    if(FIFO)
+        delete FIFO;
+    FIFO = new LMS_SamplesFIFO(65536, 2);
+    mActiveStreamConfig = config;
+    fpga::InitializeStreaming(port, config);
+    //USB FIFO reset
+    ResetUSBFIFO(port);
+}
+
+int ConnectionSTREAM::StreamService::start()
+{
+    //create threads
+    mTerminate.store(0);
+    ThreadData threadArgs;
+    threadArgs.dataPort = port;
+    threadArgs.terminate = &mTerminate;
+    threadArgs.config.channels = mActiveStreamConfig.channels;
+    threadArgs.FIFO = FIFO;
+    active = true;
+    fpga::StartStreaming(port);
+    mThread = std::thread(ReceivePackets, threadArgs);
+}
+
+int ConnectionSTREAM::StreamService::stop()
+{
+    if(!active)
         return 0;
+    mTerminate.store(1);
+    mThread.join();
+    active = false;
+    fpga::StopStreaming(port);
+}
+
+int ConnectionSTREAM::StreamService::destroy()
+{
+    if(isRunning())
+        stop();
+    if(FIFO)
+        delete FIFO;
+    FIFO = nullptr;
+}
+
+/** @brief Function dedicated for receiving data samples from board
+    @param rxFIFO FIFO to store received data
+    @param terminate periodically pooled flag to terminate thread
+    @param dataRate_Bps (optional) if not NULL periodically returns data rate in bytes per second
+*/
+void ConnectionSTREAM::StreamService::ReceivePackets(const ThreadData &args)
+{
+    auto dataPort = args.dataPort;
+    auto rxFIFO = args.FIFO;
+    auto terminate = args.terminate;
+    auto dataRate_Bps = args.dataRate_Bps;
+    //auto report = args.report;
+    //auto getCmd = args.getCmd;
+
+    //at this point Rx must be enabled in FPGA
+    unsigned long rxDroppedSamples = 0;
+    const int channelsCount = args.config.channels.size();
+    uint32_t samplesCollected = 0;
+    auto t1 = chrono::high_resolution_clock::now();
+    auto t2 = chrono::high_resolution_clock::now();
+
+    const int bufferSize = 65536;
+    const int buffersCount = 16; // must be power of 2
+    const int buffersCountMask = buffersCount - 1;
+    int handles[buffersCount];
+    memset(handles, 0, sizeof(int)*buffersCount);
+    vector<char>buffers;
+    try
+    {
+        buffers.resize(buffersCount*bufferSize, 0);
+    }
+    catch (const std::bad_alloc &ex)
+    {
+        printf("Error allocating Rx buffers, not enough memory\n");
+        return;
     }
 
-    //if interface frequency >= 5MHz, configure PLLs
-    WriteRegister(0x0005, drct_clk_ctrl_0005 & ~(1 << pllIndex));
+    //temporary buffer to store samples for batch insertion to FIFO
+    PacketFrame tempPacket;
+    tempPacket.Initialize(channelsCount);
 
-    //select FPGA index
-    pllIndex = pllIndex & 0x1F;
-    uint16_t reg23val = 0;
-    if(ReadRegister(0x0003, reg23val) != 0)
-        return ReportError(ENODEV, "ConnectionSTREAM: configure FPGA PLL, failed to read register");
+    for (int i = 0; i<buffersCount; ++i)
+        handles[i] = dataPort->BeginDataReading(&buffers[i*bufferSize], bufferSize);
 
-    const uint16_t PLLCFG_START = 0x1;
-    const uint16_t PHCFG_START = 0x2;
-    const uint16_t PLLRST_START = 0x4;
-    const uint16_t PHCFG_UPDN = 1 << 13;
-    reg23val &= 0x1F << 3; //clear PLL index
-    reg23val &= ~PLLCFG_START; //clear PLLCFG_START
-    reg23val &= ~PHCFG_START; //clear PHCFG
-    reg23val &= ~PLLRST_START; //clear PLL reset
-    reg23val &= ~PHCFG_UPDN; //clear PHCFG_UpDn
-    reg23val |= pllIndex << 3;
+    int bi = 0;
+    unsigned long totalBytesReceived = 0; //for data rate calculation
+    int m_bufferFailures = 0;
+    int16_t sample;
+    uint32_t samplesReceived = 0;
 
-    uint16_t statusReg;
-    bool done = false;
-    uint8_t errorCode = 0;
-    vector<uint32_t> addrs;
-    vector<uint32_t> values;
-    addrs.push_back(0x0023);
-    values.push_back(reg23val); //PLL_IND
-    addrs.push_back(0x0023);
-    values.push_back(reg23val | PLLRST_START); //PLLRST_START
-    WriteRegisters(addrs.data(), values.data(), values.size());
+    bool currentRxCmdValid = false;
+    size_t ignoreTxLateCount = 0;
 
-    if(boardType == LMS_DEV_QSPARK) do //wait for reset to activate
+    while (terminate->load() == false)
     {
-        ReadRegister(busyAddr, statusReg);
-        done = statusReg & 0x1;
-        errorCode = (statusReg >> 7) & 0xFF;
-    } while(!done && errorCode == 0);
-    if(errorCode != 0)
-        return ReportError(EBUSY, "ConnectionSTREAM: error resetting PLL");
+        if (ignoreTxLateCount != 0) ignoreTxLateCount--;
+        if (dataPort->WaitForReading(handles[bi], 1000) == false)
+            ++m_bufferFailures;
 
-    addrs.clear();
-    values.clear();
-    addrs.push_back(0x0023);
-    values.push_back(reg23val & ~PLLRST_START);
-
-    //configure FPGA PLLs
-    const float vcoLimits_MHz[2] = { 600, 1300 };
-    int M, C;
-    const short bufSize = 64;
-
-    float fOut_MHz = interfaceClk_Hz / 1e6;
-    float coef = 0.8*vcoLimits_MHz[1] / fOut_MHz;
-    M = C = (int)coef;
-    int chigh = (((int)coef) / 2) + ((int)(coef) % 2);
-    int clow = ((int)coef) / 2;
-
-    addrs.clear();
-    values.clear();
-    if(interfaceClk_Hz*M/1e6 > vcoLimits_MHz[0] && interfaceClk_Hz*M/1e6 < vcoLimits_MHz[1])
-    {
-        //bypass N
-        addrs.push_back(0x0026);
-        values.push_back(0x0001 | (M % 2 ? 0x8 : 0));
-
-        addrs.push_back(0x0027);
-        values.push_back(0x5550 | (C % 2 ? 0xA : 0)); //bypass c7-c1
-        addrs.push_back(0x0028);
-        values.push_back(0x5555); //bypass c15-c8
-
-        addrs.push_back(0x002A);
-        values.push_back(0x0101); //N_high_cnt, N_low_cnt
-        addrs.push_back(0x002B);
-        values.push_back(chigh << 8 | clow); //M_high_cnt, M_low_cnt
-
-        for(int i = 0; i <= 1; ++i)
+        long bytesToRead = bufferSize;
+        long bytesReceived = dataPort->FinishDataReading(&buffers[bi*bufferSize], bytesToRead, handles[bi]);
+        if (bytesReceived > 0)
         {
-            addrs.push_back(0x002E + i);
-            values.push_back(chigh << 8 | clow); // ci_high_cnt, ci_low_cnt
+            if (bytesReceived != bufferSize) //data should come in full sized packets
+                ++m_bufferFailures;
+
+            totalBytesReceived += bytesReceived;
+            for (int pktIndex = 0; pktIndex < bytesReceived / sizeof(PacketLTE); ++pktIndex)
+            {
+                PacketLTE* pkt = (PacketLTE*)&buffers[bi*bufferSize];
+                tempPacket.first = 0;
+                tempPacket.timestamp = pkt[pktIndex].counter;
+
+                int statusFlags = 0;
+                uint8_t* pktStart = (uint8_t*)pkt[pktIndex].data;
+                const int stepSize = channelsCount * 3;
+                size_t numPktBytes = sizeof(pkt->data);
+
+                auto byte0 = pkt[pktIndex].reserved[0];
+                if ((byte0 & (1 << 3)) != 0 and ignoreTxLateCount == 0)
+                {
+                    uint16_t reg9;
+                    dataPort->ReadRegister(0x0009, reg9);
+                    dataPort->WriteRegister(0x0009, reg9 | (1 << 1));
+                    dataPort->WriteRegister(0x0009, reg9 & ~(1 << 1));
+//                    if (report)
+//                        report(STATUS_FLAG_TX_LATE, pkt[pktIndex].counter);
+                    ignoreTxLateCount = 16;
+                }
+
+//                if (report)
+//                    report(STATUS_FLAG_TIME_UP, pkt[pktIndex].counter);
+
+                /*if (getCmd)
+                {
+                    auto numPacketSamps = numPktBytes/stepSize;
+
+                    //no valid command, try to pop a new command
+                    if (not currentRxCmdValid) currentRxCmdValid = getCmd(currentRxCmd);
+
+                    //command is valid, and this is an infinite read
+                    //so we always replace the command if available
+                    //the currentRxCmdValid variable remains true
+                    else if (!currentRxCmd.finiteRead) getCmd(currentRxCmd);
+
+                    //no valid command, just continue to the next pkt
+                    if (not currentRxCmdValid) continue;
+
+                    //handle timestamp logic
+                    if (currentRxCmd.waitForTimestamp)
+                    {
+                        //the specified timestamp is late
+                        //TODO report late condition to the rx fifo
+                        //we are done with this current command
+                        if (currentRxCmd.timestamp < tempPacket.timestamp)
+                        {
+                            std::cout << "L" << std::flush;
+                            //until we can report late, treat it as asap:
+                            currentRxCmd.waitForTimestamp = false;
+                            //and put this one back in....
+                            //currentRxCmdValid = false;
+                            if (report) report(STATUS_FLAG_RX_LATE, currentRxCmd.timestamp);
+                            continue;
+                        }
+
+                        //the specified timestamp is in a future packet
+                        //continue onto the next packet
+                        if (currentRxCmd.timestamp >= tempPacket.timestamp+numPacketSamps)
+                        {
+                            continue;
+                        }
+
+                        //the specified timestamp is within this packet
+                        //adjust pktStart and numPktBytes for the offset
+                        currentRxCmd.waitForTimestamp = false;
+                        auto offsetSamps = currentRxCmd.timestamp-tempPacket.timestamp;
+                        pktStart += offsetSamps*stepSize;
+                        numPktBytes -= offsetSamps*stepSize;
+                        numPacketSamps -= offsetSamps;
+                        tempPacket.timestamp += offsetSamps;
+                    }
+
+                    //total adjustments for finite read
+                    if (currentRxCmd.finiteRead)
+                    {
+                        //the current command has been depleted
+                        //adjust numPktBytes to the requested end
+                        if (currentRxCmd.numSamps <= numPacketSamps)
+                        {
+                            auto extraSamps = numPacketSamps-currentRxCmd.numSamps;
+                            numPktBytes -= extraSamps*stepSize;
+                            currentRxCmdValid = false;
+                            statusFlags |= STATUS_FLAG_RX_END;
+                        }
+                        else currentRxCmd.numSamps -= numPacketSamps;
+                    }
+                }*/
+
+                for (uint16_t b = 0; b < numPktBytes; b += stepSize)
+                {
+                    for (int ch = 0; ch < channelsCount; ++ch)
+                    {
+                        //I sample
+                        sample = (pktStart[b + 1 + 3 * ch] & 0x0F) << 8;
+                        sample |= (pktStart[b + 3 * ch] & 0xFF);
+                        sample = sample << 4;
+                        sample = sample >> 4;
+                        tempPacket.samples[ch][samplesCollected].i = sample;
+
+                        //Q sample
+                        sample = pktStart[b + 2 + 3 * ch] << 4;
+                        sample |= (pktStart[b + 1 + 3 * ch] >> 4) & 0x0F;
+                        sample = sample << 4;
+                        sample = sample >> 4;
+                        tempPacket.samples[ch][samplesCollected].q = sample;
+                    }
+                    ++samplesCollected;
+                    ++samplesReceived;
+                }
+                tempPacket.last = samplesCollected;
+
+                uint32_t samplesPushed = rxFIFO->push_samples((const complex16_t**)tempPacket.samples, samplesCollected, channelsCount, tempPacket.timestamp, 10, statusFlags);
+                if (samplesPushed != samplesCollected)
+                {
+                    rxDroppedSamples += samplesCollected - samplesPushed;
+//                    if (report)
+//                        report(STATUS_FLAG_RX_DROP, pkt[pktIndex].counter);
+                }
+                samplesCollected = 0;
+            }
+        }
+        else
+        {
+            ++m_bufferFailures;
+        }
+        t2 = chrono::high_resolution_clock::now();
+        auto timePeriod = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        if (timePeriod >= 1000)
+        {
+            //total number of bytes sent per second
+            double dataRate = 1000.0*totalBytesReceived / timePeriod;
+            //total number of samples from all channels per second
+            float samplingRate = 1000.0*samplesReceived / timePeriod;
+            samplesReceived = 0;
+            t1 = t2;
+            totalBytesReceived = 0;
+            if (dataRate_Bps)
+                dataRate_Bps->store((long)dataRate);
+            m_bufferFailures = 0;
+
+#ifndef NDEBUG
+            printf("Rx rate: %.3f MB/s Fs: %.3f MHz | dropped samples: %lu\n", dataRate / 1000000.0, samplingRate / 1000000.0, rxDroppedSamples);
+#endif
+            rxDroppedSamples = 0;
         }
 
-        float Fstep_us = 1 / (8 * fOut_MHz*C);
-        float Fstep_deg = (360 * Fstep_us) / (1 / fOut_MHz);
-        short nSteps = phaseShift_deg / Fstep_deg;
-
-        addrs.push_back(0x0024);
-        values.push_back(nSteps);
-
-        addrs.push_back(0x0023);
-        int cnt_ind = 0x3 & 0x1F;
-        reg23val = reg23val | PHCFG_UPDN | (cnt_ind << 8);
-        values.push_back(reg23val); //PHCFG_UpDn, CNT_IND
-
-        addrs.push_back(0x0023);
-        values.push_back(reg23val | PLLCFG_START); //PLLCFG_START
-        if(WriteRegisters(addrs.data(), values.data(), values.size()) != 0)
-            ReportError(EIO, "ConnectionSTREAM: configure FPGA PLL, failed to write registers");
-        if(boardType == LMS_DEV_QSPARK) do //wait for config to activate
-        {
-            ReadRegister(busyAddr, statusReg);
-            done = statusReg & 0x1;
-            errorCode = (statusReg >> 7) & 0xFF;
-        } while(!done && errorCode == 0);
-        if(errorCode != 0)
-            return ReportError(EBUSY, "ConnectionSTREAM: error configuring PLLCFG");
-
-        addrs.clear();
-        values.clear();
-        addrs.push_back(0x0023);
-        values.push_back(reg23val & ~PLLCFG_START); //PLLCFG_START
-        addrs.push_back(0x0023);
-        values.push_back(reg23val | PHCFG_START); //PHCFG_START
-        if(WriteRegisters(addrs.data(), values.data(), values.size()) != 0)
-            ReportError(EIO, "ConnectionSTREAM: configure FPGA PLL, failed to write registers");
-        if(boardType == LMS_DEV_QSPARK) do
-        {
-            ReadRegister(busyAddr, statusReg);
-            done = statusReg & 0x1;
-            errorCode = (statusReg >> 7) & 0xFF;
-        } while(!done && errorCode == 0);
-        if(errorCode != 0)
-            return ReportError(EBUSY, "ConnectionSTREAM: error configuring PHCFG");
-        addrs.clear();
-        values.clear();
-        addrs.push_back(0x0023);
-        values.push_back(reg23val & ~PHCFG_START); //PHCFG_START
-        if(WriteRegisters(addrs.data(), values.data(), values.size()) != 0)
-            ReportError(EIO, "ConnectionSTREAM: configure FPGA PLL, failed to write registers");
-        return 0;
+        // Re-submit this request to keep the queue full
+        memset(&buffers[bi*bufferSize], 0, bufferSize);
+        handles[bi] = dataPort->BeginDataReading(&buffers[bi*bufferSize], bufferSize);
+        bi = (bi + 1) & buffersCountMask;
     }
-    return ReportError(ERANGE, "ConnectionSTREAM: configure FPGA PLL, desired frequency out of range");
+    dataPort->AbortReading();
+    for (int j = 0; j<buffersCount; j++)
+    {
+        long bytesToRead = bufferSize;
+        dataPort->WaitForReading(handles[j], 1000);
+        dataPort->FinishDataReading(&buffers[j*bufferSize], bytesToRead, handles[j]);
+    }
 }

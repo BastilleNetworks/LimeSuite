@@ -660,9 +660,9 @@ Si5351C::Status Si5351C::ConfigureClocks()
         realToFrac(CLK[i].multisynthDivider, DivA, DivB, DivC);
         ss << "  Multisynth Divider " << DivA << " " << DivB << "/" << DivC;
         ss << "  R divider = " << CLK[i].outputDivider << " source = " << (CLK[i].pllSource == 0 ? "PLLA" : "PLLB");
-
+#ifdef LMS_VERBOSE_OUTPUT
         Log(ss.str(), LOG_INFO);
-
+#endif
         if( CLK[i].multisynthDivider < 8 || 900 < CLK[i].multisynthDivider)
         {
             Log("Si5351C - Output multisynth divider is outside [8;900] interval.\n", LOG_ERROR);
@@ -761,8 +761,9 @@ Si5351C::Status Si5351C::ConfigureClocks()
         int DivC;
         realToFrac(PLL[i].feedbackDivider, DivA, DivB, DivC);
         ss << "  Feedback Divider " << DivA << " " << DivB << "/" << DivC << endl;
+#ifdef LMS_VERBOSE_OUTPUT
         Log(ss.str(), LOG_INFO);
-
+#endif
         MSNx_P1 = 128 * DivA + floor(128 * ( (float)DivB/DivC)) - 512;
         MSNx_P2 = 128 * DivB - DivC * floor( 128 * DivB/DivC );
         MSNx_P3 = DivC;

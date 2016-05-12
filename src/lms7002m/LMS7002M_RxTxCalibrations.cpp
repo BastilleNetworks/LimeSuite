@@ -8,7 +8,6 @@
 #include "LMS64CProtocol.h"
 #include <vector>
 #include <ciso646>
-#define LMS_VERBOSE_OUTPUT
 
 ///define for parameter enumeration if prefix might be needed
 #define LMS7param(id) id

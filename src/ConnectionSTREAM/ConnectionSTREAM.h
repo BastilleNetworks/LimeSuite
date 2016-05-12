@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <thread>
+#include <fifo.h>
 
 #ifndef __unix__
 #include "windows.h"
@@ -105,7 +106,6 @@ public:
 	virtual int WaitForReading(int contextHandle, unsigned int timeout_ms);
 	virtual int FinishDataReading(char *buffer, long &length, int contextHandle);
 	virtual void AbortReading();
-    virtual int ReadDataBlocking(char *buffer, long &length, int timeout_ms);
 
 	virtual int BeginDataSending(const char *buffer, long length);
 	virtual int WaitForSending(int contextHandle, unsigned int timeout_ms);
@@ -129,9 +129,44 @@ public:
 	void UpdateExternalDataRate(const size_t channel, const double txRate, const double rxRate);
 	void EnterSelfCalibration(const size_t channel);
 	void ExitSelfCalibration(const size_t channel);
-protected:
-    int ConfigureFPGA_PLL(unsigned int pllIndex, const double interfaceClk_Hz, const double phaseShift_deg);
 private:
+
+    ///@brief Class for encapsulating threads for Rx/Tx streaming
+    class StreamService
+    {
+    public:
+        StreamService(ConnectionSTREAM* serPort);
+        ~StreamService();
+
+        bool isRunning() const {return active;};
+        int setup(const StreamConfig &config);
+        int start();
+        int stop();
+        int destroy();
+        LMS_SamplesFIFO* FIFO;
+        StreamConfig mActiveStreamConfig;
+    protected:
+        struct ThreadData
+        {
+            ConnectionSTREAM* dataPort; //!< Connection interface
+
+            std::atomic<bool>* terminate; //!< true exit loop
+            std::atomic<uint32_t>* dataRate_Bps; //!< report rate
+            //RxReportFunction report; //!< status report out
+            //RxPopCommandFunction getCmd; //!< external commands in
+            StreamConfig config;
+            LMS_SamplesFIFO* FIFO;
+        };
+        static void ReceivePackets(const ThreadData &args);
+        ConnectionSTREAM* port;
+        std::atomic<bool> mTerminate;
+        std::thread mThread;
+
+        bool active;
+    };
+
+    StreamService mTxService;
+    StreamService mRxService;
 
     eConnectionType GetType(void)
     {
@@ -139,7 +174,6 @@ private:
     }
 
     std::string m_hardwareName;
-    int m_hardwareVer;
 
 	USBTransferContext contexts[USB_MAX_CONTEXTS];
 	USBTransferContext contextsToSend[USB_MAX_CONTEXTS];
@@ -165,9 +199,6 @@ private:
     libusb_device_handle *dev_handle; //a device handle
     libusb_context *ctx; //a libusb session
 	#endif
-
-    //! Stream service used by the stream and time API
-    std::shared_ptr<USBStreamService> mStreamService;
 
     std::mutex mExtraUsbMutex;
 };
