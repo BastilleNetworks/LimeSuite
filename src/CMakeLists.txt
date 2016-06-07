@@ -124,6 +124,7 @@ include(ConnectionSTREAM/CMakeLists.txt)
 include(ConnectionNovenaRF7/CMakeLists.txt)
 include(Connection_uLimeSDR/CMakeLists.txt)
 include(ConnectionBastilleSensor/CMakeLists.txt)
+include(ConnectionXillybus/CMakeLists.txt)
 
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/ConnectionRegistry/BuiltinConnections.in.cpp
