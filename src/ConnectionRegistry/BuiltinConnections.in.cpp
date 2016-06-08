@@ -37,6 +37,7 @@ void __loadAllConnections(void)
 
     #ifdef ENABLE_BASTILLE_SENSOR
     __loadConnectionBastilleSensorEntry();
+    #endif
 
     #ifdef ENABLE_PCIE_XILLYBUS
     __loadConnectionXillybusEntry();
