@@ -7,11 +7,8 @@
 #cmakedefine ENABLE_STREAM
 #cmakedefine ENABLE_NOVENARF7
 #cmakedefine ENABLE_uLimeSDR
-<<<<<<< HEAD
 #cmakedefine ENABLE_BASTILLE_SENSOR
-=======
 #cmakedefine ENABLE_PCIE_XILLYBUS
->>>>>>> 1a0186bd82adcd82b87dbd389c1ebbd242a0b241
 
 void __loadConnectionEVB7COMEntry(void);
 void __loadConnectionSTREAMEntry(void);
