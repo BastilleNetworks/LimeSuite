@@ -195,12 +195,14 @@ void LMS7002M::SetActiveChannel(const Channel ch)
 
 LMS7002M::Channel LMS7002M::GetActiveChannel(bool fromChip)
 {
+    fromChip = true;
     auto ch = Get_SPI_Reg_bits(LMS7param(MAC), fromChip);
     return Channel(ch);
 }
 
 size_t LMS7002M::GetActiveChannelIndex(bool fromChip)
 {
+    fromChip = true;
     switch (this->GetActiveChannel(fromChip))
     {
     case ChB: return mdevIndex*2 + 1;
@@ -1223,7 +1225,7 @@ int LMS7002M::TuneVCO(VCO_Module module) // 0-cgen, 1-SXR, 2-SXT
         ss << "CSW_highest =" << csw_highest << endl;
         ss << "CSW_selected=" << csw_lowest+(csw_highest-csw_lowest)/2;
     }
-    
+
     cmphl = (uint8_t)Get_SPI_Reg_bits(addrCMP, 13, 12, true);
     ss << " cmphl=" << (uint16_t)cmphl;
     this->SetActiveChannel(ch); //restore previously used channel
@@ -1250,6 +1252,7 @@ int LMS7002M::TuneVCO(VCO_Module module) // 0-cgen, 1-SXR, 2-SXT
 */
 uint16_t LMS7002M::Get_SPI_Reg_bits(const LMS7Parameter &param, bool fromChip)
 {
+    fromChip = true;
 	return Get_SPI_Reg_bits(param.address, param.msb, param.lsb, fromChip);
 }
 
@@ -1262,6 +1265,7 @@ uint16_t LMS7002M::Get_SPI_Reg_bits(const LMS7Parameter &param, bool fromChip)
 */
 uint16_t LMS7002M::Get_SPI_Reg_bits(uint16_t address, uint8_t msb, uint8_t lsb, bool fromChip)
 {
+    fromChip = true;
     return (SPI_read(address, fromChip) & (~(~0<<(msb+1)))) >> lsb; //shift bits to LSB
 }
 
@@ -1272,6 +1276,7 @@ uint16_t LMS7002M::Get_SPI_Reg_bits(uint16_t address, uint8_t msb, uint8_t lsb, 
 */
 int LMS7002M::Modify_SPI_Reg_bits(const LMS7Parameter &param, const uint16_t value, bool fromChip)
 {
+    fromChip = true;
     return Modify_SPI_Reg_bits(param.address, param.msb, param.lsb, value, fromChip);
 }
 
@@ -1282,6 +1287,7 @@ int LMS7002M::Modify_SPI_Reg_bits(const LMS7Parameter &param, const uint16_t val
 */
 int LMS7002M::Modify_SPI_Reg_bits(const uint16_t address, const uint8_t msb, const uint8_t lsb, const uint16_t value, bool fromChip)
 {
+    fromChip = true;
     uint16_t spiDataReg = SPI_read(address, fromChip); //read current SPI reg data
     uint16_t spiMask = (~(~0 << (msb - lsb + 1))) << (lsb); // creates bit mask
     spiDataReg = (spiDataReg & (~spiMask)) | ((value << lsb) & spiMask);//clear bits
@@ -1496,6 +1502,7 @@ int LMS7002M::SetNCOFrequency(bool tx, uint8_t index, float_type freq_Hz)
 */
 float_type LMS7002M::GetNCOFrequency(bool tx, uint8_t index, bool fromChip)
 {
+    fromChip = true;
     if(index > 15)
         return ReportError(ERANGE, "GetNCOFrequency_MHz(index = %d) - index out of range [0, 15]", int(index));
     float_type refClk_Hz = GetReferenceClk_TSP(tx);
@@ -1657,6 +1664,7 @@ int LMS7002M::SPI_write(uint16_t address, uint16_t data)
 */
 uint16_t LMS7002M::SPI_read(uint16_t address, bool fromChip, int *status)
 {
+    fromChip = true;
     if (!controlPort || fromChip == false)
     {
         if (status && !controlPort)
